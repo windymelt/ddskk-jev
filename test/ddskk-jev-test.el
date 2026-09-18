@@ -14,6 +14,10 @@
 (defvar skk-henkan-start-point)
 (defvar skk-henkan-end-point)
 (defvar skk-henkan-okurigana)
+(defvar skk-henkan-list)
+(defvar skk-henkan-key)
+(defvar skk-henkan-count)
+(defvar skk-current-search-prog-list)
 
 (defun ddskk-jev-test--parse (body)
   "unibyte の JSON BODY をパースして alist にする。"
@@ -199,16 +203,13 @@ API キーはバックエンドに応じた環境変数から読む。"
                    '(("a" "b;x") . ("b;y" "c" "d"))))))
 
 (ert-deftest ddskk-jev-test-reorder-henkan-list-with-stubbed-http ()
-  "HTTP を差し替えた end-to-end。並べ替え結果とキャッシュを確認する。"
-  (let ((calls 0)
-        (ddskk-jev--cache (make-hash-table :test #'equal))
-        (ddskk-jev--consecutive-failures 0)
+  "HTTP を差し替えた end-to-end。並べ替え結果を確認する。"
+  (let ((ddskk-jev--consecutive-failures 0)
         (ddskk-jev--suspended nil)
         (ddskk-jev-max-candidates 12)
         (ddskk-jev-min-candidates 2))
     (cl-letf (((symbol-function 'ddskk-jev--post)
                (lambda (body)
-                 (cl-incf calls)
                  (let ((json (ddskk-jev-test--parse body)))
                    (should (equal (alist-get 'reading (alist-get 'state json))
                                   "きろく")))
@@ -223,15 +224,11 @@ API キーはバックエンドに応じた環境変数から読む。"
         (should (equal (ddskk-jev-reorder-henkan-list
                         '("帰路区" "気力;note" "記録" "きろく") state)
                        '("記録" "気力;note" "帰路区" "きろく")))
-        ;; 同じ state と候補なら再度 HTTP を呼ばない
-        (ddskk-jev-reorder-henkan-list '("帰路区" "気力;note" "記録" "きろく") state)
-        (should (= calls 1))
         (should (= ddskk-jev--consecutive-failures 0))))))
 
 (ert-deftest ddskk-jev-test-none-of-the-above-keeps-order ()
   "モデルが「どの候補も合わない」を選んだときは辞書の順序を保つ。"
-  (let ((ddskk-jev--cache (make-hash-table :test #'equal))
-        (ddskk-jev--consecutive-failures 0)
+  (let ((ddskk-jev--consecutive-failures 0)
         (ddskk-jev--suspended nil)
         (ddskk-jev-none-option t))
     (cl-letf (((symbol-function 'ddskk-jev--post)
@@ -244,8 +241,7 @@ API キーはバックエンドに応じた環境変数から読む。"
 
 (ert-deftest ddskk-jev-test-failure-keeps-order-and-suspends ()
   "失敗時は元の順序を返し、連続失敗が上限に達すると停止する。"
-  (let ((ddskk-jev--cache (make-hash-table :test #'equal))
-        (ddskk-jev--consecutive-failures 0)
+  (let ((ddskk-jev--consecutive-failures 0)
         (ddskk-jev--suspended nil)
         (ddskk-jev-max-consecutive-failures 2)
         (inhibit-message t))
@@ -266,6 +262,115 @@ API キーはバックエンドに応じた環境変数から読む。"
     (cl-letf (((symbol-function 'ddskk-jev--post)
                (lambda (_body) (ert-fail "HTTP を呼ぶべきではない"))))
       (should (equal (ddskk-jev-reorder-henkan-list '("a") "s") '("a"))))))
+
+(defmacro ddskk-jev-test--with-fake-skk (progs &rest body)
+  "ddskk の検索関数を PROGS (候補リストのリスト) を順に返すスタブにして BODY を実行する。
+`skk-search' は `skk-current-search-prog-list' の先頭を 1 つ消費し、
+対応する候補を返す。`skk-nunion' は重複を除いた連結、
+`skk-henkan-list-filter' は何もしない。"
+  (declare (indent 1))
+  `(let ((skk-current-search-prog-list (copy-sequence ,progs)))
+     (cl-letf (((symbol-function 'skk-search)
+                (lambda ()
+                  (prog1 (car skk-current-search-prog-list)
+                    (setq skk-current-search-prog-list
+                          (cdr skk-current-search-prog-list)))))
+               ((symbol-function 'skk-nunion)
+                (lambda (a b) (append a (cl-remove-if (lambda (x) (member x a)) b))))
+               ((symbol-function 'skk-henkan-list-filter)
+                (lambda () nil)))
+       ,@body)))
+
+(ert-deftest ddskk-jev-test-collect-remaining-candidates ()
+  "残りの検索プログラムをすべて評価して skk-henkan-list に追加する。"
+  (let ((skk-henkan-list '("個人")))
+    (ddskk-jev-test--with-fake-skk '(nil ("大辞書1" "個人") ("サーバ"))
+      (ddskk-jev--collect-remaining-candidates)
+      (should (equal skk-henkan-list '("個人" "大辞書1" "サーバ")))
+      (should-not skk-current-search-prog-list))))
+
+(ert-deftest ddskk-jev-test-maybe-reorder-searches-all-progs-first ()
+  "1 発目で個人辞書の候補が 1 件でも、残りの辞書を検索してから Jev に渡す。"
+  (with-temp-buffer
+    (insert "会議の▽きろく")
+    (let ((ddskk-jev-mode t)
+          (ddskk-jev--suspended nil)
+          (ddskk-jev--consecutive-failures 0)
+          (ddskk-jev-search-all-progs t)
+          (ddskk-jev-min-candidates 2)
+          (skk-henkan-count 0)
+          (skk-henkan-key "きろく")
+          (skk-henkan-okurigana nil)
+          (skk-henkan-start-point (copy-marker 5))
+          (skk-henkan-end-point (point-marker))
+          (skk-henkan-list '("帰路区"))
+          sent)
+      (ddskk-jev-test--with-fake-skk '(("気力" "記録"))
+        (cl-letf (((symbol-function 'ddskk-jev--post)
+                   (lambda (body)
+                     (setq sent (ddskk-jev-test--parse body))
+                     '((answers . ((candidate . ((type . "choice")
+                                                 (choice . "記録")
+                                                 (probabilities . ((記録 . 0.9)
+                                                                   (気力 . 0.08)
+                                                                   (帰路区 . 0.02)))))))))))
+          (ddskk-jev--maybe-reorder)))
+      (should (equal skk-henkan-list '("記録" "気力" "帰路区")))
+      (should (= (length (alist-get 'criteria
+                                    (alist-get 'candidate
+                                               (alist-get 'questions sent))))
+                 4)))))
+
+(ert-deftest ddskk-jev-test-maybe-reorder-without-search-all-progs ()
+  "`ddskk-jev-search-all-progs' が nil なら残りの辞書は検索せず、候補不足なら問い合わせない。"
+  (with-temp-buffer
+    (insert "▽きろく")
+    (let ((ddskk-jev-mode t)
+          (ddskk-jev--suspended nil)
+          (ddskk-jev-search-all-progs nil)
+          (ddskk-jev-min-candidates 2)
+          (skk-henkan-count 0)
+          (skk-henkan-key "きろく")
+          (skk-henkan-okurigana nil)
+          (skk-henkan-start-point (copy-marker 2))
+          (skk-henkan-end-point (point-marker))
+          (skk-henkan-list '("帰路区")))
+      (ddskk-jev-test--with-fake-skk '(("気力" "記録"))
+        (cl-letf (((symbol-function 'ddskk-jev--post)
+                   (lambda (_body) (ert-fail "HTTP を呼ぶべきではない"))))
+          (ddskk-jev--maybe-reorder))
+        ;; 残りの検索プログラムは消費されない
+        (should (equal skk-current-search-prog-list '(("気力" "記録")))))
+      (should (equal skk-henkan-list '("帰路区"))))))
+
+(ert-deftest ddskk-jev-test-maybe-reorder-skips-when-not-first-henkan ()
+  "2 発目以降 (skk-henkan-count が 0 以外) では何もしない。"
+  (let ((ddskk-jev-mode t)
+        (ddskk-jev--suspended nil)
+        (ddskk-jev-search-all-progs t)
+        (skk-henkan-count 1)
+        (skk-henkan-key "きろく")
+        (skk-henkan-list '("a" "b")))
+    (ddskk-jev-test--with-fake-skk '(("c"))
+      (cl-letf (((symbol-function 'ddskk-jev--post)
+                 (lambda (_body) (ert-fail "HTTP を呼ぶべきではない"))))
+        (ddskk-jev--maybe-reorder)))
+    (should (equal skk-henkan-list '("a" "b")))))
+
+(ert-deftest ddskk-jev-test-status-command ()
+  "`ddskk-jev-status' がエラーなく状態バッファを作る。"
+  (let ((ddskk-jev-backend 'vercel)
+        (ddskk-jev--suspended t)
+        (ddskk-jev--last-error "HTTP 401: x")
+        (ddskk-jev--last-latency 0.5)
+        (ddskk-jev--last-request-time (current-time)))
+    (cl-letf (((symbol-function 'ddskk-jev--api-key) (lambda () nil)))
+      (ddskk-jev-status))
+    (with-current-buffer "*ddskk-jev status*"
+      (should (string-match-p "suspended: *yes" (buffer-string)))
+      (should (string-match-p "NOT FOUND" (buffer-string)))
+      (should (string-match-p "HTTP 401" (buffer-string))))
+    (kill-buffer "*ddskk-jev status*")))
 
 (ert-deftest ddskk-jev-test-context ()
   "変換位置の前後から指定文字数を切り出す。マーカー文字は前文脈に含めない。"

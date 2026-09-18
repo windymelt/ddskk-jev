@@ -73,7 +73,10 @@
 (defvar skk-henkan-start-point)
 (defvar skk-henkan-end-point)
 (defvar skk-abbrev-mode)
+(defvar skk-current-search-prog-list)
 (declare-function skk-henkan-list-filter "skk")
+(declare-function skk-search "skk")
+(declare-function skk-nunion "skk-macs")
 
 (defgroup ddskk-jev nil
   "Reorder ddskk candidates with TypeSafe AI Jev via Vercel AI Gateway."
@@ -174,10 +177,23 @@ TypeSafe なら jev-latest) を使います。"
   "この数未満の候補しかないときは問い合わせを行いません。"
   :type 'natnum)
 
-(defcustom ddskk-jev-timeout 1.0
+(defcustom ddskk-jev-timeout 2.0
   "HTTP リクエストのタイムアウト秒数。
-超過した場合は並べ替えを諦めて元の順序を使います。"
+超過した場合は並べ替えを諦めて元の順序を使います。
+タイムアウトも失敗として数えるため、小さすぎると
+`ddskk-jev-max-consecutive-failures' に達して自動停止しやすくなります。"
   :type 'number)
+
+(defcustom ddskk-jev-search-all-progs t
+  "Non-nil なら、1 発目の変換で残りの辞書もすべて検索してから Jev に渡します。
+ddskk の `skk-search' は候補を返した最初の辞書で検索を止めるため、
+既定では 1 発目の候補は個人辞書の内容だけになります。この設定を有効に
+すると `skk-current-search-prog-list' に残っている検索プログラムをすべて
+評価し、大辞書や辞書サーバの候補も含めた一覧を Jev で並べ替えます。
+副作用として、ddskk が 2 発目以降に順次表示していた候補が 1 発目から
+候補一覧に含まれます。`skk-kakutei-when-unique-candidate' を使っている
+場合、候補が 1 件だけになる場面が減ります。"
+  :type 'boolean)
 
 (defcustom ddskk-jev-max-consecutive-failures 3
   "連続でこの回数失敗すると自動的に停止します。
@@ -225,10 +241,6 @@ TypeSafe のドキュメントは、低い確信度では行動しないこと�
 適切な値は自分の入力で試して決める必要があります。"
   :type '(choice (const :tag "常に適用" nil) number))
 
-(defcustom ddskk-jev-cache-size 256
-  "state と候補の組ごとに結果を記憶するキャッシュの上限件数。"
-  :type 'natnum)
-
 (defcustom ddskk-jev-debug nil
   "Non-nil ならリクエストと応答を `ddskk-jev-log-buffer' に記録します。"
   :type 'boolean)
@@ -243,11 +255,22 @@ TypeSafe のドキュメントは、低い確信度では行動しないこと�
 (defvar ddskk-jev--suspended nil
   "Non-nil なら失敗が続いたために問い合わせを停止しています。")
 
-(defvar ddskk-jev--cache (make-hash-table :test #'equal)
-  "問い合わせ結果のキャッシュ。キーは (state . words)、値は回答の plist。")
-
 (defvar ddskk-jev-last-response nil
   "最後に受け取った応答 (パース済み)。デバッグ用。")
+
+(defvar ddskk-jev--last-error nil
+  "最後に起きた失敗のメッセージ。")
+
+(defvar ddskk-jev--last-latency nil
+  "最後の問い合わせにかかった秒数。")
+
+(defvar ddskk-jev--last-request-time nil
+  "最後に問い合わせた時刻。")
+
+(defvar ddskk-jev--in-reorder nil
+  "並べ替え処理の再入を防ぐフラグ。
+残りの辞書を検索した後に `skk-henkan-list-filter' を呼び直すが、
+その advice から再び並べ替えに入らないようにする。")
 
 (defvar ddskk-jev-mode)
 
@@ -467,21 +490,19 @@ HTTP エラー・タイムアウト・パース失敗時は `ddskk-jev-error' �
 (defun ddskk-jev--evaluate (state candidates)
   "STATE と CANDIDATES を Jev に問い合わせ、回答の plist を返す。
 plist の形式は `ddskk-jev--answer-from-response' を参照。
-結果はキャッシュする。失敗時は `ddskk-jev-error' を signal する。"
-  (let ((cache-key (cons state candidates)))
-    (or (gethash cache-key ddskk-jev--cache)
-        (let* ((body (ddskk-jev--build-request state candidates))
-               (response (progn
-                           (ddskk-jev--log "request: %s"
-                                           (decode-coding-string body 'utf-8))
-                           (ddskk-jev--post body)))
-               (answer (ddskk-jev--answer-from-response response)))
-          (setq ddskk-jev-last-response response)
-          (ddskk-jev--log "response: %S" response)
-          (when (>= (hash-table-count ddskk-jev--cache) ddskk-jev-cache-size)
-            (clrhash ddskk-jev--cache))
-          (puthash cache-key answer ddskk-jev--cache)
-          answer))))
+失敗時は `ddskk-jev-error' を signal する。"
+  (let* ((body (ddskk-jev--build-request state candidates))
+         (start (current-time))
+         (response (progn
+                     (ddskk-jev--log "request: %s"
+                                     (decode-coding-string body 'utf-8))
+                     (setq ddskk-jev--last-request-time start)
+                     (ddskk-jev--post body)))
+         (answer (ddskk-jev--answer-from-response response)))
+    (setq ddskk-jev--last-latency (float-time (time-subtract nil start))
+          ddskk-jev-last-response response)
+    (ddskk-jev--log "response (%.3fs): %S" ddskk-jev--last-latency response)
+    answer))
 
 (defun ddskk-jev--reorder (candidates probabilities)
   "CANDIDATES を PROBABILITIES (候補本体 . 確率) の降順に安定ソートする。
@@ -560,6 +581,7 @@ plist の形式は `ddskk-jev--answer-from-response' を参照。
 (defun ddskk-jev--record-failure (message)
   "失敗を記録し、必要なら停止する。"
   (cl-incf ddskk-jev--consecutive-failures)
+  (setq ddskk-jev--last-error message)
   (ddskk-jev--log "failure (%d): %s" ddskk-jev--consecutive-failures message)
   (if (and ddskk-jev-max-consecutive-failures
            (>= ddskk-jev--consecutive-failures
@@ -572,21 +594,46 @@ plist の形式は `ddskk-jev--answer-from-response' を参照。
 
 ;;;; ddskk への接続
 
+(defun ddskk-jev--collect-remaining-candidates ()
+  "`skk-current-search-prog-list' に残る検索プログラムをすべて評価し、
+得られた候補を `skk-henkan-list' に加える。候補が増えたら
+`skk-henkan-list-filter' を呼び直して数値変換などの後処理を適用する。"
+  (when (and (boundp 'skk-current-search-prog-list)
+             (fboundp 'skk-search)
+             (fboundp 'skk-nunion))
+    (let (added)
+      (while skk-current-search-prog-list
+        (let ((candidates (skk-search)))
+          (when candidates
+            (setq skk-henkan-list (skk-nunion skk-henkan-list candidates)
+                  added t))))
+      (when added
+        (ddskk-jev--log "collected %d candidates from remaining progs"
+                        (length skk-henkan-list))
+        (skk-henkan-list-filter)))))
+
 (defun ddskk-jev--maybe-reorder ()
   "`skk-henkan-list-filter' の後に呼ばれ、条件を満たせば候補を並べ替える。
-変換の 1 発目 (`skk-henkan-count' が 0) のときだけ動作する。"
+変換の 1 発目 (`skk-henkan-count' が 0) のときだけ動作する。
+`ddskk-jev-search-all-progs' が non-nil なら、先に残りの辞書を検索する。"
   (when (and ddskk-jev-mode
              (not ddskk-jev--suspended)
+             (not ddskk-jev--in-reorder)
              (boundp 'skk-henkan-count)
              (eql skk-henkan-count 0)
              (listp skk-henkan-list)
-             (>= (length skk-henkan-list) ddskk-jev-min-candidates)
              (stringp skk-henkan-key))
-    (let ((state (ddskk-jev--build-state (ddskk-jev--context)
-                                         skk-henkan-key
-                                         skk-henkan-okurigana)))
-      (setq skk-henkan-list
-            (ddskk-jev-reorder-henkan-list skk-henkan-list state)))))
+    (let ((ddskk-jev--in-reorder t))
+      (when ddskk-jev-search-all-progs
+        (ddskk-jev--collect-remaining-candidates))
+      (if (< (length skk-henkan-list) ddskk-jev-min-candidates)
+          (ddskk-jev--log "skip: %d candidate(s) < %d"
+                          (length skk-henkan-list) ddskk-jev-min-candidates)
+        (let ((state (ddskk-jev--build-state (ddskk-jev--context)
+                                             skk-henkan-key
+                                             skk-henkan-okurigana)))
+          (setq skk-henkan-list
+                (ddskk-jev-reorder-henkan-list skk-henkan-list state)))))))
 
 ;;;###autoload
 (define-minor-mode ddskk-jev-mode
@@ -600,12 +647,44 @@ plist の形式は `ddskk-jev--answer-from-response' を参照。
 
 ;;;###autoload
 (defun ddskk-jev-reset ()
-  "失敗カウンタと停止状態をリセットし、キャッシュを空にする。"
+  "失敗カウンタと停止状態をリセットする。"
   (interactive)
   (setq ddskk-jev--consecutive-failures 0
-        ddskk-jev--suspended nil)
-  (clrhash ddskk-jev--cache)
+        ddskk-jev--suspended nil
+        ddskk-jev--last-error nil)
   (message "ddskk-jev: リセットしました"))
+
+;;;###autoload
+(defun ddskk-jev-status ()
+  "現在の状態 (有効・停止・直近の失敗・直近の応答) を表示する。"
+  (interactive)
+  (with-output-to-temp-buffer "*ddskk-jev status*"
+    (princ (format "mode:                  %s\n" (if ddskk-jev-mode "on" "off")))
+    (princ (format "backend:               %s\n" ddskk-jev-backend))
+    (princ (format "endpoint:              %s\n" (ddskk-jev--endpoint)))
+    (princ (format "model:                 %s\n" (ddskk-jev--model)))
+    (princ (format "api key:               %s\n"
+                   (if (ddskk-jev--api-key) "found" "NOT FOUND")))
+    (princ (format "suspended:             %s\n" (if ddskk-jev--suspended "yes" "no")))
+    (princ (format "consecutive failures:  %d / %s\n"
+                   ddskk-jev--consecutive-failures
+                   (or ddskk-jev-max-consecutive-failures "unlimited")))
+    (princ (format "last error:            %s\n" (or ddskk-jev--last-error "-")))
+    (princ (format "last request:          %s\n"
+                   (if ddskk-jev--last-request-time
+                       (format-time-string "%Y-%m-%d %H:%M:%S"
+                                           ddskk-jev--last-request-time)
+                     "-")))
+    (princ (format "last latency:          %s\n"
+                   (if ddskk-jev--last-latency
+                       (format "%.3fs (timeout %.1fs)"
+                               ddskk-jev--last-latency ddskk-jev-timeout)
+                     "-")))
+    (princ (format "search all progs:      %s\n" ddskk-jev-search-all-progs))
+    (princ (format "min candidates:        %d\n" ddskk-jev-min-candidates))
+    (princ (format "debug log:             %s\n"
+                   (if ddskk-jev-debug ddskk-jev-log-buffer "off (setq ddskk-jev-debug t)")))
+    (princ (format "last response:\n%S\n" ddskk-jev-last-response))))
 
 ;;;###autoload
 (defun ddskk-jev-test-connection ()
